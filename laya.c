@@ -6,13 +6,13 @@
  *        laya/agent.py  (Agent.system_one / predict), for the English checkpoint
  *        convaiinnovations/laya (ModernBERT-large encoder + decision head).
  *
- * Build:   cc -O3 -march=native -fopenmp laya.c -o laya -lm      (drop -fopenmp for 1 thread or if compiling on Mac OS)
- * Run:     ./laya MODEL_DIR example.json          ("-" reads the input from stdin)
+ * Build:   cc -O3 -march=native -fopenmp laya.c -o laya -lm      (drop -fopenmp for 1 thread)
+ * Run:     ./laya MODEL_DIR request.json          ("-" reads the request from stdin)
  *          ./laya MODEL_DIR --tokenize "text"     (print token ids)
  *          ./laya MODEL_DIR --list-tensors
- * Speed:   ~20 GFLOP/s per core with -march=native; a ~100-token question is ~3 s on one core, ~16 s at the full
- *          512 tokens (scales with cores under OpenMP). Load: ~3 s, ~1.9 GB RSS. Questions in one request run
- *          one after another (the Python path batches them on a GPU).
+ * Speed:   ALWAYS build with -march=native (the GEMM uses whatever SIMD width the compiler targets: AVX2/AVX-512/NEON).
+ *          Measured on one AVX-512 core: ~0.7 s for a ~90-token question, ~4 s at the full 512 tokens (~80 GFLOP/s);
+ *          scales with cores under OpenMP. Load: ~2 s, ~1.9 GB RSS. Questions run one after another.
  * Env:     LAYA_DEBUG=1  dump serialized state, token ids, raw logits, timing to stderr
  *          OMP_NUM_THREADS=N  thread count when built with OpenMP
  *
@@ -51,24 +51,6 @@
 #define FSEEK fseeko
 #endif
 
-#ifndef TIME_UTC
-#define TIME_UTC 1
-#endif
-
-#ifndef HAVE_TIMESPEC_GET
-static int portable_timespec_get(struct timespec *ts, int base)
-{
-    if (base != TIME_UTC)
-        return 0;
-
-    ts->tv_sec = time(NULL);
-    ts->tv_nsec = 0;
-
-    return TIME_UTC;
-}
-#define timespec_get portable_timespec_get
-#endif
-
 /* ================================================================== base */
 
 static void die(const char *fmt, ...)
@@ -97,9 +79,13 @@ static void *xrealloc(void *q, size_t n)
 
 static double now_ms(void)
 {
+#if defined(CLOCK_MONOTONIC) && !defined(_WIN32)
     struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+#else
+    return (double)clock() * 1e3 / CLOCKS_PER_SEC; /* coarse fallback (CPU time) */
+#endif
 }
 
 static char *read_file(const char *path, size_t *len_out)
@@ -1230,17 +1216,35 @@ static float *ld(STFile *st, const char *name, size_t numel, int enc)
     return st_load(st, T, numel);
 }
 
-/* load an nn.Linear weight [N,K] and return it transposed as [K,N] for linear() */
+/* Register-tile geometry shared by the weight packer and linear(). */
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(LAYA_NO_SIMD)
+#define LAYA_VEC 1
+#if defined(__AVX512F__)
+#define VW 16
+#else
+#define VW 8
+#endif
+typedef float vf __attribute__((vector_size(VW * 4), aligned(4), may_alias));
+#else
+#define VW 8
+#endif
+#define MR 6
+#define NR (2 * VW)
+#define KB 256
+
+/* Load an nn.Linear weight [N,K] and repack it into NR-column panels: panel p holds columns p*NR..p*NR+NR-1 as
+ * [K][NR] contiguous floats (zero padded), so linear() streams weights sequentially. */
 static float *ldT(STFile *st, const char *name, size_t N, size_t K, int enc)
 {
-    float *w = ld(st, name, N * K, enc), *t = xmalloc(N * K * sizeof(float));
-    enum { B = 32 };
-    for (size_t n0 = 0; n0 < N; n0 += B)
-        for (size_t k0 = 0; k0 < K; k0 += B) {
-            size_t n1 = n0 + B < N ? n0 + B : N, k1 = k0 + B < K ? k0 + B : K;
-            for (size_t n = n0; n < n1; n++)
-                for (size_t k = k0; k < k1; k++) t[k * N + n] = w[n * K + k];
-        }
+    float *w = ld(st, name, N * K, enc);
+    size_t npan = (N + NR - 1) / NR;
+    float *t = calloc(npan * K * NR, sizeof(float));
+    if (!t) die("out of memory");
+    for (size_t n = 0; n < N; n++) {
+        float *dst = t + (n / NR) * K * NR + n % NR;
+        const float *src = w + n * K;
+        for (size_t k = 0; k < K; k++) dst[k * NR] = src[k];
+    }
     free(w);
     return t;
 }
@@ -1272,7 +1276,7 @@ static void load_config(Laya *M, const char *dir, const JV **encfg_out, Arena *A
             M->temps[M->ntemps++].t = (float)tb->v[i]->num;
         }
 
-    /* encoder architecture: config.json (falls back to ModernBERT-large defaults) */
+    /* encoder architecture: encoder/config.json (falls back to ModernBERT-large defaults) */
     snprintf(path, sizeof path, "%s/config.json", dir);
     FILE *f = fopen(path, "rb");
     const JV *ec = NULL;
@@ -1393,6 +1397,7 @@ static Laya *laya_load_impl(const char *dir, int tokenizer_only, int list_only)
     if (!a0 || !a2) die("act_head tensors not found");
     M->act_hidden = (int)a0->shape[0];
     M->n_act = (int)a2->shape[0];
+    if (M->n_act > 16) die("act_head has %d outputs (max 16)", M->n_act);
     M->act_w1 = ldT(&st, "act_head.0.weight", (size_t)M->act_hidden, d + 4, 0);
     M->act_b1 = ld(&st, "act_head.0.bias", (size_t)M->act_hidden, 0);
     M->act_w2 = ldT(&st, "act_head.2.weight", (size_t)M->n_act, (size_t)M->act_hidden, 0);
@@ -1456,50 +1461,48 @@ static float dotf(const float *a, const float *b, int n)
     return t;
 }
 
-/* C[M,N] = A[M,K] . Wt[K,N] (+ bias[N]).  Wt is a torch.nn.Linear weight [N,K] transposed once at load time so the
- * inner loop runs along N (contiguous, no reductions => the compiler emits plain SIMD FMAs without -ffast-math).
- * Summation order per output element is fixed (K in blocks of KB), so results do not depend on the thread count. */
-#define MR 4
-#define NR 16
-#define KB 256
-static void linear(float *restrict C, const float *restrict A, int M, int K, const float *restrict Wt, const float *restrict bias, int N)
+/* C[M,N] = A[M,K] . W (+ bias[N]) with W packed by ldT(). MR x NR register tile, K walked in blocks of KB whose
+ * partial sums are added in a fixed order, so results do not depend on the thread count. */
+static void linear(float *restrict C, const float *restrict A, int M, int K, const float *restrict Wp, const float *restrict bias, int N)
 {
     int npan = (N + NR - 1) / NR;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (int nb = 0; nb < npan; nb++) {
+        const float *wp = Wp + (size_t)nb * K * NR;
         int n0 = nb * NR, nr = N - n0 < NR ? N - n0 : NR;
         for (int m0 = 0; m0 < M; m0 += MR) {
             int mr = M - m0 < MR ? M - m0 : MR;
-            float tot[MR][NR] = {{0}};
+            const float *ar[MR];
+            for (int i = 0; i < MR; i++) ar[i] = A + (size_t)(m0 + (i < mr ? i : 0)) * K; /* pad rows: result discarded */
+            float tot[MR][NR];
+            memset(tot, 0, sizeof tot);
             for (int k0 = 0; k0 < K; k0 += KB) {
                 int k1 = K - k0 < KB ? K : k0 + KB;
-                float acc[MR][NR] = {{0}};
-                if (mr == MR && nr == NR) {
-                    const float *a0 = A + (size_t)m0 * K, *a1 = a0 + K, *a2 = a1 + K, *a3 = a2 + K;
-                    for (int k = k0; k < k1; k++) {
-                        const float *w = Wt + (size_t)k * N + n0;
-                        float x0 = a0[k], x1 = a1[k], x2 = a2[k], x3 = a3[k];
-                        for (int j = 0; j < NR; j++) {
-                            float wj = w[j];
-                            acc[0][j] += x0 * wj;
-                            acc[1][j] += x1 * wj;
-                            acc[2][j] += x2 * wj;
-                            acc[3][j] += x3 * wj;
-                        }
-                    }
-                } else { /* edge tiles */
-                    for (int k = k0; k < k1; k++) {
-                        const float *w = Wt + (size_t)k * N + n0;
-                        for (int i = 0; i < mr; i++) {
-                            float x = A[(size_t)(m0 + i) * K + k];
-                            for (int j = 0; j < nr; j++) acc[i][j] += x * w[j];
-                        }
+#ifdef LAYA_VEC
+                vf c[MR][2], z = {0};
+                for (int i = 0; i < MR; i++) c[i][0] = c[i][1] = z;
+                for (int k = k0; k < k1; k++) {
+                    vf w0 = *(const vf *)(wp + (size_t)k * NR), w1 = *(const vf *)(wp + (size_t)k * NR + VW);
+                    for (int i = 0; i < MR; i++) {
+                        float x = ar[i][k];
+                        c[i][0] += w0 * x;
+                        c[i][1] += w1 * x;
                     }
                 }
+                for (int i = 0; i < MR; i++) {
+                    *(vf *)&tot[i][0] += c[i][0];
+                    *(vf *)&tot[i][VW] += c[i][1];
+                }
+#else
+                float c[MR][NR] = {{0}};
+                for (int k = k0; k < k1; k++)
+                    for (int i = 0; i < MR; i++)
+                        for (int j = 0; j < NR; j++) c[i][j] += ar[i][k] * wp[(size_t)k * NR + j];
                 for (int i = 0; i < MR; i++)
-                    for (int j = 0; j < NR; j++) tot[i][j] += acc[i][j];
+                    for (int j = 0; j < NR; j++) tot[i][j] += c[i][j];
+#endif
             }
             for (int i = 0; i < mr; i++)
                 for (int j = 0; j < nr; j++) C[(size_t)(m0 + i) * N + n0 + j] = tot[i][j] + (bias ? bias[n0 + j] : 0.0f);
@@ -1509,6 +1512,9 @@ static void linear(float *restrict C, const float *restrict A, int M, int K, con
 
 static void layernorm(float *out, const float *x, const float *w, const float *b, int T, int d, float eps)
 {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int t = 0; t < T; t++) {
         const float *xr = x + (size_t)t * d;
         float *o = out + (size_t)t * d;
@@ -1635,6 +1641,9 @@ static void forward(const Laya *M, const int *ids, int T, const int *markers, in
         for (size_t k = 0; k < Td; k++) h[k] += tmp[k];
         layernorm(xn, h, L->mlp_norm, NULL, T, d, M->eps);
         linear(wi, xn, T, d, L->Wi, NULL, 2 * dff);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int t = 0; t < T; t++) {
             const float *r = wi + (size_t)t * 2 * dff;
             float *o = g + (size_t)t * dff;
@@ -1704,7 +1713,7 @@ static void forward(const Laya *M, const int *ids, int T, const int *markers, in
     ain[d + 3] = (float)K / 255.0f;
     linear(ah, ain, 1, d + 4, M->act_w1, M->act_b1, M->act_hidden);
     for (int j = 0; j < M->act_hidden; j++) ah[j] = gelu(ah[j]);
-    linear(al, ah, 1, M->act_hidden, M->act_w2, M->act_b2, M->n_act > 16 ? 16 : M->n_act);
+    linear(al, ah, 1, M->act_hidden, M->act_w2, M->act_b2, M->n_act);
     float amx = al[0], asum = 0;
     for (int j = 1; j < M->n_act && j < 16; j++)
         if (al[j] > amx) amx = al[j];
