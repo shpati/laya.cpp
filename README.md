@@ -1,6 +1,6 @@
 # laya.cpp
 
-C/C++ port of NandhaKishorM/laya
+C/C++ port of NandhaKishorM/laya. The laya.cpp program was made using AI. 
 
 Runs on CPU. Windows, Linux, Mac OS. 
 
@@ -19,6 +19,7 @@ laya.cpp
   |-- rl_agent_config.json  # copy from huggingface.co/convaiinnovations/laya
   |-- tokenizer.json        # copy from huggingface.co/convaiinnovations/laya/tokenizer folder
 ```
+
 
 
 ### Build:
