@@ -9,16 +9,16 @@ Runs on CPU. Windows, Linux, Mac OS.
 ### Dependencies:
 
 Copy the following files to your directory of choice (eg. laya.cpp): 
-
->  laya.cpp
-> |-- config.json                    # copy from [convaiinnovations/laya/encoder](https://huggingface.co/convaiinnovations/laya/resolve/main/encoder/config.json)
-> |-- example.json
-> |-- laya.c
-> |-- README.md
-> |-- model.safetensors      # copy from [convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya/resolve/main/model.safetensors)
-> |-- rl_agent_config.json    # copy from [convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya/resolve/main/rl_agent_config.json)
-> |-- tokenizer.json              # copy from [convaiinnovations/laya/tokenizer](https://huggingface.co/convaiinnovations/laya/resolve/main/tokenizer/tokenizer.json)
-
+```
+laya.cpp
+  |-- config.json           # copy from huggingface.co/convaiinnovations/laya/encoder folder
+  |-- example.json
+  |-- laya.c
+  |-- README.md
+  |-- model.safetensors     # copy from huggingface.co/convaiinnovations/laya 
+  |-- rl_agent_config.json  # copy from huggingface.co/convaiinnovations/laya
+  |-- tokenizer.json        # copy from huggingface.co/convaiinnovations/laya/tokenizer folder
+```
 
 
 ### Build:
