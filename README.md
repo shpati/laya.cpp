@@ -2,7 +2,7 @@
 
 C/C++ port of NandhaKishorM/laya. The laya.cpp program was made using AI. 
 
-Runs on CPU. Windows, Linux, Mac OS. 
+Runs on CPU. Works on Linux and Windows. 
 
 
 
@@ -27,7 +27,6 @@ laya.cpp
 ```
 cd laya.cpp
 cc -O3 -march=native -fopenmp laya.c -o laya -lm    (on Linux or Windows)
-cc -O3 -march=native laya.c -o laya -lm             (on Mac OS)
 ```
 
 
@@ -38,6 +37,7 @@ cc -O3 -march=native laya.c -o laya -lm             (on Mac OS)
 ./laya MODEL_DIR input.json          ("-" reads the input from stdin)
 ./laya MODEL_DIR --tokenize "text"   (print token ids)
 ./laya MODEL_DIR --list-tensors
+./laya MODEL_DIR --serve [PORT] [--bind ADDR]   (HTTP server, default 127.0.0.1:29417)
 ```
 
 
@@ -45,6 +45,10 @@ cc -O3 -march=native laya.c -o laya -lm             (on Mac OS)
 ### Example:
 
 ```
-./laya . example.json                (runs example on Linux, Mac OS)
+./laya . example.json                (runs example on Linux)
 laya.exe . example.json              (runs example on Windows)
+
+In server mode:
+./laya . --serve
+curl -s --data-binary @example.json localhost:29417/predict
 ```
