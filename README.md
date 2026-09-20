@@ -1,23 +1,24 @@
 # laya.cpp
 
-C/C++ port of NandhaKishorM/laya
+C/C++ port of NandhaKishorM/laya. The laya.cpp program was made using AI. 
 
-Runs on CPU. Windows, Linux, Mac OS. 
+Runs on CPU. Works on Linux and Windows. 
 
 
 
 ### Dependencies:
 
 Copy the following files to your directory of choice (eg. laya.cpp): 
-
->  laya.cpp
-> |-- config.json                    # copy from [convaiinnovations/laya/encoder](https://huggingface.co/convaiinnovations/laya/resolve/main/encoder/config.json)
-> |-- example.json
-> |-- laya.c
-> |-- README.md
-> |-- model.safetensors      # copy from [convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya/resolve/main/model.safetensors)
-> |-- rl_agent_config.json    # copy from [convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya/resolve/main/rl_agent_config.json)
-> |-- tokenizer.json              # copy from [convaiinnovations/laya/tokenizer](https://huggingface.co/convaiinnovations/laya/resolve/main/tokenizer/tokenizer.json)
+```
+laya.cpp
+  |-- config.json           # copy from huggingface.co/convaiinnovations/laya/encoder folder
+  |-- example.json
+  |-- laya.c
+  |-- README.md
+  |-- model.safetensors     # copy from huggingface.co/convaiinnovations/laya 
+  |-- rl_agent_config.json  # copy from huggingface.co/convaiinnovations/laya
+  |-- tokenizer.json        # copy from huggingface.co/convaiinnovations/laya/tokenizer folder
+```
 
 
 
@@ -26,7 +27,6 @@ Copy the following files to your directory of choice (eg. laya.cpp):
 ```
 cd laya.cpp
 cc -O3 -march=native -fopenmp laya.c -o laya -lm    (on Linux or Windows)
-cc -O3 -march=native laya.c -o laya -lm             (on Mac OS)
 ```
 
 
@@ -37,6 +37,7 @@ cc -O3 -march=native laya.c -o laya -lm             (on Mac OS)
 ./laya MODEL_DIR input.json          ("-" reads the input from stdin)
 ./laya MODEL_DIR --tokenize "text"   (print token ids)
 ./laya MODEL_DIR --list-tensors
+./laya MODEL_DIR --serve [PORT] [--bind ADDR]   (HTTP server, default 127.0.0.1:29417)
 ```
 
 
@@ -44,6 +45,10 @@ cc -O3 -march=native laya.c -o laya -lm             (on Mac OS)
 ### Example:
 
 ```
-./laya . example.json                (runs example on Linux, Mac OS)
+./laya . example.json                (runs example on Linux)
 laya.exe . example.json              (runs example on Windows)
+
+In server mode:
+./laya . --serve
+curl -s --data-binary @example.json localhost:29417/predict
 ```
