@@ -6,10 +6,15 @@
  *        laya/agent.py  (Agent.system_one / predict), for the English checkpoint
  *        convaiinnovations/laya (ModernBERT-large encoder + decision head).
  *
- * Build:   cc -O3 -march=native -fopenmp laya.c -o laya -lm      (drop -fopenmp for 1 thread)
+ * Build:   Linux:    cc -O3 -march=native -fopenmp laya.c -o laya -lm
+ *          Windows:  gcc -O3 -march=native -fopenmp -static laya.c -o laya.exe -lws2_32 -lm     (MinGW-w64 / MSYS2)
+ *                    (-static avoids shipping libgomp-1.dll / libwinpthread-1.dll; MSVC's cl is not supported)
  * Run:     ./laya MODEL_DIR request.json          ("-" reads the request from stdin)
  *          ./laya MODEL_DIR --tokenize "text"     (print token ids)
  *          ./laya MODEL_DIR --list-tensors
+ *          ./laya MODEL_DIR --serve [PORT] [--bind ADDR]   HTTP server (default 127.0.0.1:29417), model loaded once;
+ *                    GET /status, POST /predict (same JSON as the CLI). Linux/macOS: process per connection;
+ *                    Windows: thread per connection. Inference is serialized, /status answers while it runs.
  * Speed:   ALWAYS build with -march=native (the GEMM uses whatever SIMD width the compiler targets: AVX2/AVX-512/NEON).
  *          Measured on one AVX-512 core: ~0.7 s for a ~90-token question, ~4 s at the full 512 tokens (~80 GFLOP/s);
  *          scales with cores under OpenMP. Load: ~2 s, ~1.9 GB RSS. Questions run one after another.
@@ -32,7 +37,12 @@
  *   - Numerics are float32 with a fixed summation order, so results agree with PyTorch to ~1e-4,
  *     not bit-for-bit.
  */
+#ifdef __MINGW32__
+#define __USE_MINGW_ANSI_STDIO 1 /* %zu etc. in the MinGW msvcrt */
+#endif
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
+#define _DARWIN_C_SOURCE
 #define _FILE_OFFSET_BITS 64
 #include <math.h>
 #include <stdarg.h>
@@ -41,8 +51,41 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
+#include <errno.h>
+#include <setjmp.h>
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+/* Strict -std=c11 turns off FMA contraction (~25% slower GEMM); allow it explicitly. */
+#if defined(__clang__)
+#pragma clang fp contract(fast)
+#elif defined(__GNUC__)
+#pragma GCC optimize("fp-contract=fast")
+#endif
+
+#define LAYA_SERVER 1
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600 /* inet_pton */
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <process.h>
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #endif
 
 #ifdef _WIN32
@@ -53,33 +96,142 @@
 
 /* ================================================================== base */
 
+#if defined(_MSC_VER)
+#define LAYA_TLS __declspec(thread)
+#else
+#define LAYA_TLS _Thread_local
+#endif
+
+/* In the HTTP server each connection is handled by a forked child (POSIX) or a thread (Windows) that sets g_jmp,
+ * so a failing request unwinds to an error response instead of exiting. In CLI mode g_jmp is NULL and die()
+ * prints and exits. */
+#if defined(__GNUC__) || defined(__clang__)
+/* The compiler builtins restore registers without unwinding, which is robust across threads and on 64-bit MinGW
+ * (where longjmp goes through SEH unwinding). */
+typedef void *laya_jmp[5];
+#define LAYA_SETJMP(b) __builtin_setjmp(b)
+#define LAYA_LONGJMP(b) __builtin_longjmp((b), 1)
+#else
+typedef jmp_buf laya_jmp;
+#define LAYA_SETJMP(b) setjmp(b)
+#define LAYA_LONGJMP(b) longjmp((b), 1)
+#endif
+static LAYA_TLS laya_jmp *g_jmp;
+static LAYA_TLS char g_errmsg[512];
+
 static void die(const char *fmt, ...)
 {
     va_list ap;
-    fputs("laya: ", stderr);
     va_start(ap, fmt);
+    if (g_jmp) {
+        vsnprintf(g_errmsg, sizeof g_errmsg, fmt, ap);
+        va_end(ap);
+        LAYA_LONGJMP(*g_jmp);
+    }
+    fputs("laya: ", stderr);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
     exit(1);
 }
 
+/* All heap memory goes through xmalloc/xrealloc/xfree (free() is redirected below). While request tracking is on
+ * (per thread), live blocks are chained so a request that dies mid-way can be released in one sweep -- this keeps a
+ * long-running server leak-free under malformed requests without any per-call cleanup code. */
+typedef struct AHdr {
+    struct AHdr *prev, *next;
+    size_t tracked, pad; /* 32-byte header keeps 16-byte alignment */
+} AHdr;
+static LAYA_TLS AHdr *g_tr_head;
+static LAYA_TLS int g_tr_on;
+
 static void *xmalloc(size_t n)
 {
-    void *p = malloc(n ? n : 1);
-    if (!p) die("out of memory (%zu bytes)", n);
-    return p;
+    AHdr *h = malloc(sizeof(AHdr) + (n ? n : 1));
+    if (!h) die("out of memory (%zu bytes)", n);
+    h->tracked = (size_t)g_tr_on;
+    h->prev = NULL;
+    h->next = NULL;
+    if (g_tr_on) {
+        h->next = g_tr_head;
+        if (g_tr_head) g_tr_head->prev = h;
+        g_tr_head = h;
+    }
+    return h + 1;
 }
 static void *xrealloc(void *q, size_t n)
 {
-    void *p = realloc(q, n ? n : 1);
-    if (!p) die("out of memory (%zu bytes)", n);
+    if (!q) return xmalloc(n);
+    AHdr *h = (AHdr *)q - 1, *nh = realloc(h, sizeof(AHdr) + (n ? n : 1));
+    if (!nh) die("out of memory (%zu bytes)", n);
+    if (nh != h && nh->tracked) {
+        if (nh->prev) nh->prev->next = nh;
+        else g_tr_head = nh;
+        if (nh->next) nh->next->prev = nh;
+    }
+    return nh + 1;
+}
+static void xfree(void *p)
+{
+    if (!p) return;
+    AHdr *h = (AHdr *)p - 1;
+    if (h->tracked) {
+        if (h->prev) h->prev->next = h->next;
+        else g_tr_head = h->next;
+        if (h->next) h->next->prev = h->prev;
+    }
+    free(h);
+}
+#define free xfree
+/* Raw malloc/calloc/realloc/strdup must not be mixed with free() from here on. */
+#define malloc   LAYA_use_xmalloc_instead
+#define calloc   LAYA_use_xcalloc_instead
+#define realloc  LAYA_use_xrealloc_instead
+#define strdup   LAYA_use_xstrdup_instead
+static void *xcalloc(size_t n, size_t m)
+{
+    void *p = xmalloc(n * m);
+    memset(p, 0, n * m);
     return p;
+}
+static char *xstrdup(const char *s)
+{
+    size_t n = strlen(s);
+    char *r = xmalloc(n + 1);
+    memcpy(r, s, n + 1);
+    return r;
+}
+static void req_begin(void) { g_tr_on = 1; }
+static void req_end(void) /* success: whatever is still allocated now belongs to the caller */
+{
+    for (AHdr *h = g_tr_head; h;) {
+        AHdr *nx = h->next;
+        h->tracked = 0;
+        h->prev = h->next = NULL;
+        h = nx;
+    }
+    g_tr_head = NULL;
+    g_tr_on = 0;
+}
+static void req_abort(void) /* failure: release everything the request still holds */
+{
+    g_tr_on = 0;
+    for (AHdr *h = g_tr_head; h;) {
+        AHdr *nx = h->next;
+        free(h + 1);
+        h = nx;
+    }
+    g_tr_head = NULL;
 }
 
 static double now_ms(void)
 {
-#if defined(CLOCK_MONOTONIC) && !defined(_WIN32)
+#if defined(_WIN32)
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1e3 / (double)f.QuadPart;
+#elif defined(CLOCK_MONOTONIC)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
@@ -628,7 +780,7 @@ static void st_open(STFile *st, const char *path)
         const JV *e = root->v[i], *dt = jget(e, "dtype"), *sh = jget(e, "shape"), *of = jget(e, "data_offsets");
         if (!dt || !sh || !of || of->n != 2) die("%s: bad tensor entry %s", path, root->k[i]);
         STensor *T = &st->t[st->n++];
-        T->name = strdup(root->k[i]);
+        T->name = xstrdup(root->k[i]);
         if (!strcmp(dt->s, "F32")) T->dtype = 0;
         else if (!strcmp(dt->s, "F16")) T->dtype = 1;
         else if (!strcmp(dt->s, "BF16")) T->dtype = 2;
@@ -680,7 +832,7 @@ static float *st_load(STFile *st, const STensor *T, size_t want_numel)
     static const int esz[3] = {4, 2, 2};
     if (T->off1 - T->off0 != numel * (size_t)esz[T->dtype]) die("tensor %s: inconsistent data_offsets", T->name);
     float *out = xmalloc(numel * sizeof(float));
-    if (FSEEK(st->f, (off_t)(st->base + T->off0), SEEK_SET) != 0) die("seek failed for %s", T->name);
+    if (FSEEK(st->f, (long long)(st->base + T->off0), SEEK_SET) != 0) die("seek failed for %s", T->name);
     if (T->dtype == 0) {
         if (fread(out, 4, numel, st->f) != numel) die("short read on %s", T->name);
     } else {
@@ -1238,8 +1390,7 @@ static float *ldT(STFile *st, const char *name, size_t N, size_t K, int enc)
 {
     float *w = ld(st, name, N * K, enc);
     size_t npan = (N + NR - 1) / NR;
-    float *t = calloc(npan * K * NR, sizeof(float));
-    if (!t) die("out of memory");
+    float *t = xcalloc(npan * K * NR, sizeof(float));
     for (size_t n = 0; n < N; n++) {
         float *dst = t + (n / NR) * K * NR + n % NR;
         const float *src = w + n * K;
@@ -2083,6 +2234,450 @@ char *laya_predict(Laya *M, const char *request_json)
     return out.s;
 }
 
+/* ================================================================== HTTP server */
+
+#define LAYA_DEFAULT_PORT 29417 /* below the Linux ephemeral range (32768+), unassigned by IANA */
+
+/* Model + tokenizer are loaded once. Every accepted connection is handled concurrently with the others, but
+ * inference itself is serialized so requests queue instead of oversubscribing the cores, and /status is answered
+ * while an inference is running.
+ *   POSIX:   one forked child per connection (weights shared copy-on-write, a crash only kills its child);
+ *            serialization = fcntl record lock, released automatically if a child dies.
+ *   Windows: one thread per connection; serialization = CRITICAL_SECTION.
+ * In both cases a request that fails (die()) is unwound with longjmp and everything it allocated is released. */
+
+typedef struct {
+    long served, failed, in_flight;
+    double last_ms, total_ms, load_ms, start_ms;
+} Stats;
+static Stats *g_st;
+static int g_port;
+
+#if defined(__GNUC__) || defined(__clang__)
+#define ATOMIC_ADD(p, v) __atomic_add_fetch((p), (v), __ATOMIC_SEQ_CST)
+#elif defined(_WIN32)
+#define ATOMIC_ADD(p, v) (InterlockedExchangeAdd((volatile LONG *)(p), (LONG)(v)) + (v))
+#else
+#define ATOMIC_ADD(p, v) (*(p) += (v))
+#endif
+
+#ifdef _WIN32
+typedef SOCKET sock_t;
+#define SHUT_WR SD_SEND
+static void sock_close(sock_t s) { closesocket(s); }
+static long sock_recv(sock_t s, void *b, size_t n)
+{
+    int r = recv(s, (char *)b, (int)(n > (1u << 30) ? (1u << 30) : n), 0);
+    if (r < 0) return WSAGetLastError() == WSAEINTR ? -2 : -1;
+    return r;
+}
+static long sock_send(sock_t s, const void *b, size_t n)
+{
+    int r = send(s, (const char *)b, (int)(n > (1u << 30) ? (1u << 30) : n), 0);
+    if (r < 0) return WSAGetLastError() == WSAEINTR ? -2 : -1;
+    return r;
+}
+static void sock_timeouts(sock_t s, int sec)
+{
+    DWORD ms = (DWORD)sec * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof ms);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&ms, sizeof ms);
+}
+static CRITICAL_SECTION g_cs;
+static volatile LONG g_running;
+static void inf_lock(void)
+{
+    EnterCriticalSection(&g_cs);
+    g_running = 1;
+}
+static void inf_unlock(void)
+{
+    g_running = 0;
+    LeaveCriticalSection(&g_cs);
+}
+static int inference_running(void) { return g_running != 0; }
+#else
+typedef int sock_t;
+static void sock_close(sock_t s) { close(s); }
+static long sock_recv(sock_t s, void *b, size_t n)
+{
+    ssize_t r = recv(s, b, n, 0);
+    if (r < 0) return errno == EINTR ? -2 : -1;
+    return (long)r;
+}
+static long sock_send(sock_t s, const void *b, size_t n)
+{
+    ssize_t r = send(s, b, n, 0);
+    if (r < 0) return errno == EINTR ? -2 : -1;
+    return (long)r;
+}
+static void sock_timeouts(sock_t s, int sec)
+{
+    struct timeval tv = {sec, 0};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+static int g_lockfd = -1;
+static void inf_lockop(int type)
+{
+    struct flock fl;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = (short)type;
+    fl.l_whence = SEEK_SET;
+    while (fcntl(g_lockfd, F_SETLKW, &fl) != 0 && errno == EINTR) {}
+}
+static void inf_lock(void) { inf_lockop(F_WRLCK); }
+static void inf_unlock(void) { inf_lockop(F_UNLCK); }
+static int inference_running(void)
+{
+    struct flock fl;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    if (fcntl(g_lockfd, F_GETLK, &fl) != 0) return -1;
+    return fl.l_type != F_UNLCK;
+}
+#endif
+
+static int send_all(sock_t fd, const char *p, size_t n)
+{
+    while (n) {
+        long w = sock_send(fd, p, n);
+        if (w == -2) continue;
+        if (w <= 0) return -1;
+        p += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+static void http_reply(sock_t fd, int code, const char *reason, const char *body, size_t n, double ms)
+{
+    char h[320];
+    int k = snprintf(h, sizeof h,
+                     "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n", code, reason, n);
+    if (ms >= 0) k += snprintf(h + k, sizeof h - (size_t)k, "X-Laya-Ms: %.1f\r\n", ms);
+    k += snprintf(h + k, sizeof h - (size_t)k, "\r\n");
+    if (send_all(fd, h, (size_t)k) == 0) send_all(fd, body, n);
+}
+
+static void http_error(sock_t fd, int code, const char *reason, const char *msg)
+{
+    Buf b = {0};
+    buf_puts(&b, "{\"error\": ");
+    json_str(&b, msg, strlen(msg), 0);
+    buf_putc(&b, '}');
+    http_reply(fd, code, reason, b.s, b.n, -1);
+    free(b.s);
+}
+
+/* case-insensitive helpers; `lower` must already be lower-case */
+static int ci_prefix(const char *s, const char *lower)
+{
+    for (; *lower; s++, lower++)
+        if (tolower((unsigned char)*s) != *lower) return 0;
+    return 1;
+}
+static int ci_line_has(const char *s, const char *lower) /* within the current header line only */
+{
+    size_t n = strlen(lower);
+    for (; *s && *s != '\r' && *s != '\n'; s++) {
+        size_t i = 0;
+        while (i < n && s[i] && tolower((unsigned char)s[i]) == lower[i]) i++;
+        if (i == n) return 1;
+    }
+    return 0;
+}
+
+#define HTTP_MAX_HEADER (64 * 1024)
+#define HTTP_MAX_BODY (32u * 1024 * 1024)
+
+/* Reads one request. Returns 0 on success (method/path filled, *body malloc'd, NUL-terminated), -1 if the peer went
+ * away, else an HTTP status to answer with. */
+static int http_read(sock_t fd, char *method, char *path, char **body, size_t *blen)
+{
+    size_t cap = 8192, n = 0, hend = 0;
+    char *b = xmalloc(cap + 1);
+    for (;;) {
+        if (n == cap) {
+            if (cap >= HTTP_MAX_HEADER) {
+                free(b);
+                return 431;
+            }
+            cap *= 2;
+            b = xrealloc(b, cap + 1);
+        }
+        long r = sock_recv(fd, b + n, cap - n);
+        if (r == -2) continue;
+        if (r <= 0) {
+            free(b);
+            return -1;
+        }
+        size_t from = n > 3 ? n - 3 : 0;
+        n += (size_t)r;
+        b[n] = 0;
+        char *e = strstr(b + from, "\r\n\r\n");
+        if (e) {
+            hend = (size_t)(e - b) + 4;
+            break;
+        }
+    }
+    method[0] = path[0] = 0;
+    if (sscanf(b, "%15s %1023s", method, path) != 2) {
+        free(b);
+        return 400;
+    }
+    char *q = strchr(path, '?');
+    if (q) *q = 0;
+    size_t cl = 0;
+    int expect = 0;
+    for (char *l = strstr(b, "\r\n"); l && l + 2 < b + hend; l = strstr(l + 2, "\r\n")) {
+        char *h = l + 2;
+        if (ci_prefix(h, "content-length:")) cl = (size_t)strtoull(h + 15, NULL, 10);
+        else if (ci_prefix(h, "expect:") && ci_line_has(h, "100-continue")) expect = 1;
+        else if (ci_prefix(h, "transfer-encoding:") && ci_line_has(h, "chunked")) {
+            free(b);
+            return 501;
+        }
+    }
+    if (cl > HTTP_MAX_BODY) {
+        free(b);
+        return 413;
+    }
+    char *body_buf = xmalloc(cl + 1);
+    size_t have = n - hend;
+    if (have > cl) have = cl;
+    memcpy(body_buf, b + hend, have);
+    free(b);
+    if (have < cl && expect) send_all(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    while (have < cl) {
+        long r = sock_recv(fd, body_buf + have, cl - have);
+        if (r == -2) continue;
+        if (r <= 0) {
+            free(body_buf);
+            return -1;
+        }
+        have += (size_t)r;
+    }
+    body_buf[cl] = 0;
+    *body = body_buf;
+    *blen = cl;
+    return 0;
+}
+
+static void status_json(Laya *M, Buf *b)
+{
+    double up = (now_ms() - g_st->start_ms) / 1e3;
+    long served = g_st->served;
+    char t[768];
+#ifdef _OPENMP
+    int threads = omp_get_max_threads();
+#else
+    int threads = 1;
+#endif
+    snprintf(t, sizeof t,
+             "{\"status\": \"ready\", \"model\": \"laya-rl-agent\", \"port\": %d, \"uptime_s\": %.1f, \"load_ms\": %.0f, "
+             "\"requests\": {\"served\": %ld, \"failed\": %ld, \"in_flight\": %ld, \"inference_running\": %s}, "
+             "\"latency_ms\": {\"last\": %.1f, \"avg\": %.1f}, "
+             "\"engine\": {\"hidden\": %d, \"layers\": %d, \"heads\": %d, \"vocab\": %d, \"max_len\": %d, \"head_max_len\": %d, "
+             "\"threads\": %d, \"openmp\": %s}}",
+             g_port, up, g_st->load_ms, served, g_st->failed, g_st->in_flight, inference_running() > 0 ? "true" : "false",
+             g_st->last_ms, served ? g_st->total_ms / (double)served : 0.0, M->d, M->nl, M->nh, M->vocab, M->max_len,
+             M->head_max_len, threads,
+#ifdef _OPENMP
+             "true"
+#else
+             "false"
+#endif
+    );
+    buf_puts(b, t);
+}
+
+/* Handles one connection (forked child on POSIX, thread on Windows). Never returns via die(): errors become HTTP 400. */
+static void serve_conn(Laya *M, sock_t fd)
+{
+    sock_timeouts(fd, 15);
+    laya_jmp jb;
+    g_jmp = &jb;
+    volatile int is_predict = 0, locked = 0; /* read after longjmp */
+    req_begin();
+    if (LAYA_SETJMP(jb)) { /* die() was called somewhere below */
+        if (locked) inf_unlock();
+        req_abort();
+        if (is_predict) ATOMIC_ADD(&g_st->failed, 1);
+        http_error(fd, 400, "Bad Request", g_errmsg);
+        g_jmp = NULL;
+        return;
+    }
+    char method[16], path[1024];
+    char *body = NULL;
+    size_t blen = 0;
+    int rc = http_read(fd, method, path, &body, &blen);
+    if (rc < 0) {
+        req_abort();
+        g_jmp = NULL;
+        return;
+    }
+    if (rc) {
+        http_error(fd, rc, rc == 413 ? "Payload Too Large" : rc == 431 ? "Request Header Fields Too Large" : rc == 501 ? "Not Implemented" : "Bad Request",
+                   rc == 501 ? "chunked request bodies are not supported; send Content-Length" : "malformed request");
+    } else if (!strcmp(path, "/status") || !strcmp(path, "/health") || !strcmp(path, "/healthz")) {
+        if (strcmp(method, "GET") && strcmp(method, "HEAD")) {
+            http_error(fd, 405, "Method Not Allowed", "use GET");
+        } else {
+            Buf b = {0};
+            status_json(M, &b);
+            http_reply(fd, 200, "OK", b.s, b.n, -1);
+            free(b.s);
+        }
+    } else if (!strcmp(path, "/predict") || !strcmp(path, "/questions") || !strcmp(path, "/")) {
+        if (strcmp(method, "POST")) {
+            http_error(fd, 405, "Method Not Allowed", "use POST with a JSON body {\"state\": ..., \"questions\": {...}}");
+        } else {
+            is_predict = 1;
+            inf_lock();
+            locked = 1;
+            double t0 = now_ms();
+            char *res = laya_predict(M, body);
+            double ms = now_ms() - t0;
+            g_st->last_ms = ms;
+            g_st->total_ms += ms;
+            ATOMIC_ADD(&g_st->served, 1);
+            locked = 0;
+            inf_unlock();
+            http_reply(fd, 200, "OK", res, strlen(res), ms);
+            free(res);
+        }
+    } else {
+        http_error(fd, 404, "Not Found", "endpoints: GET /status, POST /predict");
+    }
+    free(body);
+    req_end();
+    g_jmp = NULL;
+}
+
+#ifdef _WIN32
+typedef struct {
+    Laya *M;
+    SOCKET s;
+} ConnArg;
+
+static unsigned __stdcall conn_thread(void *p)
+{
+    ConnArg a = *(ConnArg *)p;
+    free(p);
+    serve_conn(a.M, a.s);
+    shutdown(a.s, SHUT_WR);
+    closesocket(a.s);
+    ATOMIC_ADD(&g_st->in_flight, -1);
+    return 0;
+}
+#else
+static void on_sigchld(int sig)
+{
+    (void)sig;
+    int saved = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0) ATOMIC_ADD(&g_st->in_flight, -1);
+    errno = saved;
+}
+#endif
+
+static void serve_forever(Laya *M, const char *bind_addr, int port, double load_ms)
+{
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) die("WSAStartup failed");
+    g_st = xcalloc(1, sizeof *g_st);
+    InitializeCriticalSection(&g_cs);
+#else
+    g_st = mmap(NULL, sizeof *g_st, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (g_st == MAP_FAILED) die("mmap failed");
+    memset(g_st, 0, sizeof *g_st);
+    FILE *tf = tmpfile();
+    if (!tf) die("tmpfile failed");
+    g_lockfd = fileno(tf);
+    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigchld;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+#endif
+    g_st->load_ms = load_ms;
+    g_st->start_ms = now_ms();
+    g_port = port;
+
+    sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+    if (ls == INVALID_SOCKET) die("socket failed");
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof one); /* SO_REUSEADDR would allow port hijacking here */
+#else
+    if (ls < 0) die("socket failed");
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#endif
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, bind_addr, &a.sin_addr) != 1) die("bad bind address '%s'", bind_addr);
+    if (bind(ls, (struct sockaddr *)&a, sizeof a) != 0) die("cannot bind %s:%d (port in use? try --serve OTHER_PORT)", bind_addr, port);
+    if (listen(ls, 128) != 0) die("listen failed");
+    fprintf(stderr, "laya: model loaded in %.0f ms; listening on http://%s:%d  (GET /status, POST /predict)\n", load_ms, bind_addr, port);
+    fflush(stderr);
+    for (;;) {
+        sock_t c = accept(ls, NULL, NULL);
+#ifdef _WIN32
+        if (c == INVALID_SOCKET) {
+            Sleep(10);
+            continue;
+        }
+#else
+        if (c < 0) {
+            if (errno != EINTR) perror("laya: accept");
+            continue;
+        }
+#endif
+        if (g_st->in_flight >= 64) {
+            http_error(c, 503, "Service Unavailable", "too many connections in flight");
+            sock_close(c);
+            continue;
+        }
+        ATOMIC_ADD(&g_st->in_flight, 1);
+#ifdef _WIN32
+        /* NB: must come from xmalloc -- free() is xfree(), which expects the allocator's header (a raw malloc'd
+         * block here corrupted the Windows heap: STATUS_HEAP_CORRUPTION 0xc0000374). */
+        ConnArg *ca = xmalloc(sizeof *ca);
+        ca->M = M;
+        ca->s = c;
+        HANDLE th = (HANDLE)_beginthreadex(NULL, 0, conn_thread, ca, 0, NULL);
+        if (!th) {
+            ATOMIC_ADD(&g_st->in_flight, -1);
+            http_error(c, 503, "Service Unavailable", "cannot start worker thread");
+            sock_close(c);
+            free(ca);
+        } else {
+            CloseHandle(th);
+        }
+#else
+        pid_t pid = fork();
+        if (pid == 0) {
+            sock_close(ls);
+            serve_conn(M, c);
+            shutdown(c, SHUT_WR);
+            sock_close(c);
+            _exit(0);
+        }
+        if (pid < 0) {
+            ATOMIC_ADD(&g_st->in_flight, -1);
+            http_error(c, 503, "Service Unavailable", "fork failed");
+        }
+        sock_close(c);
+#endif
+    }
+}
+
 /* ================================================================== CLI */
 
 #ifndef LAYA_NO_MAIN
@@ -2092,8 +2687,9 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s MODEL_DIR REQUEST.json|-\n"
                 "       %s MODEL_DIR --tokenize TEXT\n"
-                "       %s MODEL_DIR --list-tensors\n",
-                argv[0], argv[0], argv[0]);
+                "       %s MODEL_DIR --list-tensors\n"
+                "       %s MODEL_DIR --serve [PORT] [--bind ADDR]   (HTTP server, default 127.0.0.1:%d)\n",
+                argv[0], argv[0], argv[0], argv[0], LAYA_DEFAULT_PORT);
         return 2;
     }
     if (!strcmp(argv[2], "--tokenize")) {
@@ -2109,6 +2705,19 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[2], "--list-tensors")) {
         laya_load_impl(argv[1], 0, 1);
+        return 0;
+    }
+    if (!strcmp(argv[2], "--serve")) {
+        int port = LAYA_DEFAULT_PORT;
+        const char *bind_addr = "127.0.0.1";
+        for (int i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_addr = argv[++i];
+            else if (atoi(argv[i]) > 0 && atoi(argv[i]) < 65536) port = atoi(argv[i]);
+            else die("unknown argument '%s' (usage: MODEL_DIR --serve [PORT] [--bind ADDR])", argv[i]);
+        }
+        double ts = now_ms();
+        Laya *M = laya_load(argv[1]);
+        serve_forever(M, bind_addr, port, now_ms() - ts);
         return 0;
     }
     double t0 = now_ms();
